@@ -87,8 +87,8 @@ defmodule Jido.AI.Tools.Manager do
     # Get conversation state
     case ConversationManager.get(conversation_id) do
       {:ok, conversation} ->
-        # Convert actions to tools
-        tools = SchemaConverter.actions_to_tools(action_modules)
+        # Pass action modules to ChatCompletion, which will translate them to provider-specific tool schemas.
+        tools = action_modules
         action_map = SchemaConverter.build_action_map(action_modules)
 
         # Run the tool loop
@@ -140,13 +140,14 @@ defmodule Jido.AI.Tools.Manager do
     # Get conversation state
     case ConversationManager.get(conversation_id) do
       {:ok, conversation} ->
-        tools = SchemaConverter.actions_to_tools(action_modules)
+        # Pass action modules to ChatCompletion, which will translate them to provider-specific tool schemas.
+        tools = action_modules
         action_map = SchemaConverter.build_action_map(action_modules)
 
         # Return a stream that processes the tool loop
         stream =
           Stream.resource(
-            fn -> init_stream_state(conversation, tools, action_map, context, max_iterations) end,
+            fn -> init_stream_state(conversation, tools, action_map, context, max_iterations, opts) end,
             &stream_next/1,
             fn _state -> :ok end
           )
@@ -264,11 +265,13 @@ defmodule Jido.AI.Tools.Manager do
       # Save final assistant message
       :ok = ConversationManager.add_message(conversation.id, :assistant, content)
 
+      max_iterations = Keyword.get(opts, :max_iterations, @default_max_iterations)
+
       {:ok,
        %{
          content: content,
          conversation_id: conversation.id,
-         tool_calls_made: @default_max_iterations - iterations_left
+         tool_calls_made: max_iterations - iterations_left
        }}
     end
   end
@@ -277,15 +280,17 @@ defmodule Jido.AI.Tools.Manager do
   # Private - Streaming Loop
   # =============================================================================
 
-  defp init_stream_state(conversation, tools, action_map, context, max_iterations) do
+  defp init_stream_state(conversation, tools, action_map, context, max_iterations, opts) do
     %{
       conversation: conversation,
       tools: tools,
       action_map: action_map,
       context: context,
+      opts: opts,
       iterations_left: max_iterations,
       phase: :call_llm,
       accumulated_content: "",
+      accumulated_tool_calls: [],
       current_stream: nil,
       done: false
     }
@@ -298,13 +303,14 @@ defmodule Jido.AI.Tools.Manager do
   defp stream_next(%{phase: :call_llm} = state) do
     {:ok, messages} = ConversationManager.get_messages_for_llm(state.conversation.id)
 
-    case call_llm_stream(state.conversation.model, messages, state.tools) do
+    case call_llm_stream(state.conversation.model, messages, state.tools, state.opts) do
       {:ok, llm_stream} ->
         new_state = %{
           state
           | phase: :streaming,
             current_stream: llm_stream,
-            accumulated_content: ""
+            accumulated_content: "",
+            accumulated_tool_calls: []
         }
 
         stream_next(new_state)
@@ -318,12 +324,15 @@ defmodule Jido.AI.Tools.Manager do
     case get_next_chunk(stream) do
       {:chunk, chunk, rest_stream} ->
         content = Map.get(chunk, :content, "")
+        chunk_tool_calls = Map.get(chunk, :tool_calls, [])
         new_content = state.accumulated_content <> content
+        new_tool_calls = state.accumulated_tool_calls ++ chunk_tool_calls
 
         new_state = %{
           state
           | current_stream: rest_stream,
-            accumulated_content: new_content
+            accumulated_content: new_content,
+            accumulated_tool_calls: new_tool_calls
         }
 
         if content != "" do
@@ -333,7 +342,14 @@ defmodule Jido.AI.Tools.Manager do
         end
 
       {:done, final_response} ->
-        handle_stream_response(final_response, state)
+        # Merge accumulated tool_calls into final_response
+        final_with_accumulated = Map.update(
+          final_response,
+          :tool_calls,
+          state.accumulated_tool_calls,
+          fn existing -> (existing || []) ++ state.accumulated_tool_calls end
+        )
+        handle_stream_response(final_with_accumulated, state)
     end
   end
 
@@ -420,13 +436,17 @@ defmodule Jido.AI.Tools.Manager do
   defp get_next_chunk(stream) do
     # This handles both regular streams and collected responses
     case stream do
+      # ReqLLM.StreamResponse - extract the inner stream
+      %ReqLLM.StreamResponse{stream: inner_stream} ->
+        get_next_chunk(inner_stream)
+
       %Stream{} ->
         # Try to get next element from stream
         try do
           case Enum.take(stream, 1) do
             [chunk] ->
               rest = Stream.drop(stream, 1)
-              {:chunk, chunk, rest}
+              {:chunk, normalize_chunk(chunk), rest}
 
             [] ->
               {:done, %{content: ""}}
@@ -441,15 +461,59 @@ defmodule Jido.AI.Tools.Manager do
 
       # List of chunks
       [chunk | rest] ->
-        {:chunk, chunk, rest}
+        {:chunk, normalize_chunk(chunk), rest}
 
       [] ->
         {:done, %{content: ""}}
 
-      _ ->
-        {:done, %{content: ""}}
+      # Generic enumerable (e.g., from Stream functions)
+      enumerable ->
+        try do
+          case Enum.take(enumerable, 1) do
+            [chunk] ->
+              rest = Stream.drop(enumerable, 1)
+              {:chunk, normalize_chunk(chunk), rest}
+
+            [] ->
+              {:done, %{content: ""}}
+          end
+        rescue
+          _ -> {:done, %{content: ""}}
+        end
     end
   end
+
+  # Normalize different chunk formats to a consistent map
+  defp normalize_chunk(%ReqLLM.StreamChunk{type: :content} = chunk) do
+    %{content: chunk.text || "", tool_calls: []}
+  end
+
+  defp normalize_chunk(%ReqLLM.StreamChunk{type: :thinking} = chunk) do
+    # Include thinking tokens as content (for models like Claude)
+    %{content: chunk.text || "", tool_calls: []}
+  end
+
+  defp normalize_chunk(%ReqLLM.StreamChunk{type: :tool_call} = chunk) do
+    tool_call = %{
+      id: chunk.metadata[:id] || "call_#{:erlang.unique_integer([:positive])}",
+      function: %{
+        name: chunk.name,
+        arguments: if(is_binary(chunk.arguments), do: chunk.arguments, else: Jason.encode!(chunk.arguments || %{}))
+      }
+    }
+    %{content: "", tool_calls: [tool_call]}
+  end
+
+  defp normalize_chunk(%ReqLLM.StreamChunk{type: :meta}) do
+    %{content: "", tool_calls: []}
+  end
+
+  defp normalize_chunk(%ReqLLM.StreamChunk{} = _chunk) do
+    %{content: "", tool_calls: []}
+  end
+
+  defp normalize_chunk(chunk) when is_map(chunk), do: chunk
+  defp normalize_chunk(_), do: %{content: ""}
 
   # =============================================================================
   # Private - Tool Execution
@@ -519,26 +583,34 @@ defmodule Jido.AI.Tools.Manager do
 
   defp call_llm(model, messages, tools, opts) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
+    api_key = Keyword.get(opts, :api_key)
 
     params = %{
       model: model,
       messages: messages,
-      tools: tools
+      tools: tools,
+      timeout: timeout,
+      api_key: api_key
     }
 
     # Use ChatCompletion action
-    case ChatCompletion.run(params, %{timeout: timeout}) do
+    case ChatCompletion.run(params, %{}) do
       {:ok, response} -> {:ok, response}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp call_llm_stream(model, messages, tools) do
+  defp call_llm_stream(model, messages, tools, opts) do
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
+    api_key = Keyword.get(opts, :api_key)
+
     params = %{
       model: model,
       messages: messages,
       tools: tools,
-      stream: true
+      stream: true,
+      timeout: timeout,
+      api_key: api_key
     }
 
     case ChatCompletion.run(params, %{}) do

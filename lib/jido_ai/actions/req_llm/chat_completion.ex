@@ -66,13 +66,26 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
       ],
       prompt: [
         type: {:custom, Jido.AI.Prompt, :validate_prompt_opts, []},
-        required: true,
-        doc: "The prompt to use for the response"
+        required: false,
+        doc: "The prompt to use for the response (alternative to :messages)"
+      ],
+      messages: [
+        type: :any,
+        required: false,
+        doc:
+          "A list of chat messages in ReqLLM format (alternative to :prompt). Supports tool calling fields like :tool_calls, :tool_call_id, :name."
       ],
       tools: [
-        type: {:list, :atom},
+        type: {:list, :any},
         required: false,
-        doc: "List of Jido.Action modules for function calling"
+        doc:
+          "Tools for function calling. Accepts a list of Jido.Action modules, ReqLLM.Tool structs, or OpenAI-style tool schema maps."
+      ],
+      api_key: [
+        type: :string,
+        required: false,
+        doc:
+          "Provider API key override for ReqLLM (useful for local testing). Prefer env vars in production."
       ],
       max_retries: [
         type: :integer,
@@ -106,8 +119,8 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
   @impl true
   def on_before_validate_params(params) do
     with {:ok, model} <- validate_model(params.model),
-         {:ok, prompt} <- Prompt.validate_prompt_opts(params.prompt) do
-      {:ok, %{params | model: model, prompt: prompt}}
+         {:ok, params} <- validate_prompt_or_messages(params) do
+      {:ok, %{params | model: model}}
     else
       {:error, reason} ->
         Logger.error("ChatCompletion validation failed: #{inspect(reason)}")
@@ -119,7 +132,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
   def run(params, _context) do
     # Validate required parameters exist
     with :ok <- validate_required_param(params, :model, "model"),
-         :ok <- validate_required_param(params, :prompt, "prompt") do
+         :ok <- validate_required_prompt_or_messages(params) do
       run_with_validated_params(params)
     else
       {:error, reason} -> {:error, reason}
@@ -138,7 +151,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
       end
 
     # Keep required parameters
-    required_params = Map.take(params, [:model, :prompt, :tools])
+    required_params = Map.take(params, [:model, :prompt, :messages, :tools])
 
     # Create a map with all optional parameters set to defaults
     # Priority: explicit params > prompt options > defaults
@@ -167,6 +180,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
           :stop,
           :timeout,
           :stream,
+          :api_key,
           :max_retries,
           :frequency_penalty,
           :presence_penalty,
@@ -179,12 +193,12 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
 
     if params_with_defaults.verbose do
       Logger.info(
-        "Running ReqLLM chat completion with params: #{inspect(params_with_defaults, pretty: true)}"
+        "Running ReqLLM chat completion with params: #{inspect(redact_for_log(params_with_defaults), pretty: true)}"
       )
     end
 
     with {:ok, model} <- validate_model(params_with_defaults.model),
-         {:ok, messages} <- convert_messages(params_with_defaults.prompt),
+         {:ok, messages} <- normalize_messages(params_with_defaults),
          {:ok, req_options} <- build_req_llm_options(model, params_with_defaults),
          result <- call_reqllm(model, messages, req_options, params_with_defaults) do
       result
@@ -205,6 +219,17 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     end
   end
 
+  defp validate_required_prompt_or_messages(params) do
+    has_prompt? = Map.has_key?(params, :prompt) && !is_nil(Map.get(params, :prompt))
+    has_messages? = Map.has_key?(params, :messages) && is_list(Map.get(params, :messages))
+
+    if has_prompt? or has_messages? do
+      :ok
+    else
+      {:error, "Missing required parameter: prompt or messages"}
+    end
+  end
+
   defp validate_model(%ReqLLM.Model{} = model), do: {:ok, model}
   defp validate_model(%Model{} = model), do: Model.from(model)
   defp validate_model(spec) when is_tuple(spec), do: Model.from(spec)
@@ -214,15 +239,78 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     {:error, "Invalid model specification: #{inspect(other)}"}
   end
 
-  defp convert_messages(prompt) do
-    messages =
-      Prompt.render(prompt)
-      |> Enum.map(fn msg ->
-        %{role: msg.role, content: msg.content}
+  defp validate_prompt_or_messages(params) do
+    cond do
+      Map.has_key?(params, :prompt) && !is_nil(Map.get(params, :prompt)) ->
+        with {:ok, prompt} <- Prompt.validate_prompt_opts(params.prompt) do
+          {:ok, %{params | prompt: prompt}}
+        end
+
+      Map.has_key?(params, :messages) && is_list(Map.get(params, :messages)) ->
+        {:ok, params}
+
+      true ->
+        {:error, "Missing required parameter: prompt or messages"}
+    end
+  end
+
+  defp normalize_messages(params) do
+    cond do
+      Map.has_key?(params, :messages) && is_list(Map.get(params, :messages)) ->
+        normalize_message_list(params.messages)
+
+      Map.has_key?(params, :prompt) && !is_nil(Map.get(params, :prompt)) ->
+        messages =
+          params.prompt
+          |> Prompt.render()
+          |> Enum.map(fn msg ->
+            %{role: Atom.to_string(msg.role), content: msg.content}
+          end)
+
+        {:ok, messages}
+
+      true ->
+        {:error, "Missing required parameter: prompt or messages"}
+    end
+  end
+
+  defp normalize_message_list(messages) when is_list(messages) do
+    normalized =
+      Enum.map(messages, fn
+        msg when is_binary(msg) ->
+          %{role: "user", content: msg}
+
+        msg when is_map(msg) ->
+          role = Map.get(msg, :role) || Map.get(msg, "role") || "user"
+          content = Map.get(msg, :content) || Map.get(msg, "content") || ""
+
+          role =
+            case role do
+              r when is_atom(r) -> Atom.to_string(r)
+              r when is_binary(r) -> r
+              other -> to_string(other)
+            end
+
+          %{
+            role: role,
+            content: content
+          }
+          |> maybe_put(:tool_calls, Map.get(msg, :tool_calls) || Map.get(msg, "tool_calls"))
+          |> maybe_put(:tool_call_id, Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id"))
+          |> maybe_put(:name, Map.get(msg, :name) || Map.get(msg, "name"))
+
+        other ->
+          %{
+            role: "user",
+            content: inspect(other)
+          }
       end)
 
-    {:ok, messages}
+    {:ok, normalized}
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp build_req_llm_options(_model, params) do
     # Build base options
@@ -232,6 +320,8 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
       |> add_opt_if_present(:max_tokens, params.max_tokens)
       |> add_opt_if_present(:top_p, params.top_p)
       |> add_opt_if_present(:stop, params.stop)
+      |> add_opt_if_present(:receive_timeout, params.timeout)
+      |> add_opt_if_present(:api_key, params[:api_key])
       |> add_opt_if_present(:frequency_penalty, params.frequency_penalty)
       |> add_opt_if_present(:presence_penalty, params.presence_penalty)
 
@@ -239,28 +329,31 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     opts_with_tools =
       case params[:tools] do
         tools when is_list(tools) and length(tools) > 0 ->
-          # Convert tools directly to ReqLLM format
-          tool_specs =
-            Enum.map(tools, fn tool ->
-              %{
-                name: tool.name,
-                description: Map.get(tool, :description, ""),
-                parameters: Map.get(tool, :parameters, %{})
-              }
-            end)
-
-          Keyword.put(base_opts, :tools, tool_specs)
+          with {:ok, tool_specs} <- normalize_tools(tools) do
+            Keyword.put(base_opts, :tools, tool_specs)
+          end
 
         _ ->
           base_opts
       end
 
     # ReqLLM handles authentication internally via environment variables
-    {:ok, opts_with_tools}
+    case opts_with_tools do
+      opts when is_list(opts) -> {:ok, opts}
+      {:ok, opts} when is_list(opts) -> {:ok, opts}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp add_opt_if_present(opts, _key, nil), do: opts
   defp add_opt_if_present(opts, key, value), do: Keyword.put(opts, key, value)
+
+  defp redact_for_log(params) when is_map(params) do
+    case Map.get(params, :api_key) do
+      nil -> params
+      _ -> Map.put(params, :api_key, "[REDACTED]")
+    end
+  end
 
   defp call_reqllm(model, messages, req_options, params) do
     # Build model spec string from ReqLLM.Model
@@ -297,18 +390,70 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     end
   end
 
+  defp format_response(%ReqLLM.Response{} = response) do
+    format_response(%{
+      content: ReqLLM.Response.text(response) || "",
+      tool_calls: ReqLLM.Response.tool_calls(response) || []
+    })
+  end
+
   defp format_response(%{content: content, tool_calls: tool_calls}) when is_list(tool_calls) do
-    formatted_tools =
-      Enum.map(tool_calls, fn tool ->
-        %{
-          name: tool[:name] || tool["name"],
-          arguments: tool[:arguments] || tool["arguments"],
-          # Will be populated after execution
-          result: nil
-        }
+    formatted_tool_calls =
+      Enum.map(tool_calls, fn
+        %ReqLLM.ToolCall{} = tool_call ->
+          %{
+            id: tool_call.id,
+            function: %{
+              name: tool_call.function.name,
+              arguments: tool_call.function.arguments
+            }
+          }
+
+        %{id: _id, function: %{name: _name, arguments: _arguments}} = tool_call ->
+          tool_call
+
+        %{"id" => _id, "function" => %{"name" => _name, "arguments" => _arguments}} = tool_call ->
+          tool_call
+
+        %{name: name, arguments: arguments} ->
+          %{
+            id: nil,
+            function: %{
+              name: name,
+              arguments:
+                if is_binary(arguments) do
+                  arguments
+                else
+                  Jason.encode!(arguments)
+                end
+            }
+          }
+
+        %{"name" => name, "arguments" => arguments} ->
+          %{
+            id: nil,
+            function: %{
+              name: name,
+              arguments:
+                if is_binary(arguments) do
+                  arguments
+                else
+                  Jason.encode!(arguments)
+                end
+            }
+          }
+
+        other ->
+          %{
+            id: nil,
+            function: %{
+              name: "unknown",
+              arguments: Jason.encode!(%{raw: inspect(other)})
+            }
+          }
       end)
 
-    {:ok, %{content: content, tool_results: formatted_tools}}
+    {:ok, %{content: content, tool_results: formatted_tool_calls}}
   end
 
   defp format_response(%{content: content}) do
@@ -320,4 +465,79 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     content = response[:content] || response["content"] || ""
     {:ok, %{content: content, tool_results: []}}
   end
+
+  defp normalize_tools(tools) when is_list(tools) do
+    tool_specs = Enum.map(tools, &to_req_llm_tool/1)
+
+    if Enum.any?(tool_specs, &match?({:error, _}, &1)) do
+      {:error, :invalid_tools}
+    else
+      {:ok, Enum.map(tool_specs, fn {:ok, tool} -> tool end)}
+    end
+  end
+
+  defp to_req_llm_tool(%ReqLLM.Tool{} = tool), do: {:ok, tool}
+
+  defp to_req_llm_tool(tool) when is_atom(tool) do
+    _ = Code.ensure_loaded?(tool)
+
+    name =
+      if function_exported?(tool, :name, 0) do
+        tool.name()
+      else
+        tool |> Module.split() |> List.last() |> Macro.underscore()
+      end
+
+    description =
+      if function_exported?(tool, :description, 0) do
+        tool.description()
+      else
+        "No description available"
+      end
+
+    parameter_schema =
+      if function_exported?(tool, :schema, 0) do
+        tool.schema()
+      else
+        []
+      end
+
+    {:ok,
+     ReqLLM.Tool.new!(
+       name: name,
+       description: description,
+       parameter_schema: parameter_schema,
+       callback: fn _args -> {:error, :tool_execution_not_supported} end
+     )}
+  end
+
+  defp to_req_llm_tool(%{type: "function", function: function} = _tool) when is_map(function) do
+    to_req_llm_tool(function)
+  end
+
+  defp to_req_llm_tool(%{"type" => "function", "function" => function} = _tool) when is_map(function) do
+    to_req_llm_tool(function)
+  end
+
+  defp to_req_llm_tool(%{name: name} = function) when is_binary(name) do
+    {:ok,
+     ReqLLM.Tool.new!(
+       name: name,
+       description: Map.get(function, :description, ""),
+       parameter_schema: Map.get(function, :parameters, %{}),
+       callback: fn _args -> {:error, :tool_execution_not_supported} end
+     )}
+  end
+
+  defp to_req_llm_tool(%{"name" => name} = function) when is_binary(name) do
+    {:ok,
+     ReqLLM.Tool.new!(
+       name: name,
+       description: Map.get(function, "description", ""),
+       parameter_schema: Map.get(function, "parameters", %{}),
+       callback: fn _args -> {:error, :tool_execution_not_supported} end
+     )}
+  end
+
+  defp to_req_llm_tool(_other), do: {:error, :invalid_tool}
 end
