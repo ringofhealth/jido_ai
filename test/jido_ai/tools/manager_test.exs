@@ -152,4 +152,63 @@ defmodule Jido.AI.Tools.ManagerTest do
     {:ok, messages} = ConversationManager.get_messages(conversation_id)
     assert Enum.any?(messages, &(&1.role == :tool))
   end
+
+  test "process_stream/4 supports non-streaming LLM mode and can emit thinking status" do
+    model = ReqLLM.Model.new(:openai, "gpt-4o")
+    {:ok, conversation_id} = ConversationManager.create(model)
+
+    ReqLLM
+    |> stub(:generate_text, fn _model_id, messages, opts ->
+      tools = Keyword.get(opts, :tools, [])
+      assert [%ReqLLM.Tool{name: "echo"} | _] = tools
+      assert Keyword.get(opts, :api_key) == "test-key"
+
+      tool_message =
+        Enum.find(messages, fn msg ->
+          role = Map.get(msg, :role) || Map.get(msg, "role")
+          role in [:tool, "tool"]
+        end)
+
+      if tool_message do
+        {:ok, %{content: "done"}}
+      else
+        tool_call = %{
+          "id" => "call_1",
+          "type" => "function",
+          "function" => %{"name" => "echo", "arguments" => ~s({"text":"hi"})}
+        }
+
+        {:ok, %{content: "Planning: call echo", tool_calls: [tool_call]}}
+      end
+    end)
+
+    {:ok, stream} =
+      ToolsManager.process_stream(conversation_id, "hello", [EchoAction],
+        max_iterations: 3,
+        timeout: 5_000,
+        api_key: "test-key",
+        llm_stream: false,
+        emit_thinking: true
+      )
+
+    events = Enum.to_list(stream)
+
+    assert Enum.any?(events, fn
+             {:status, %{status: :thinking, message: "Planning: call echo"}} -> true
+             _ -> false
+           end)
+
+    assert Enum.any?(events, fn
+             {:tool_call, %{id: "call_1", name: "echo", arguments: %{"text" => "hi"}}} -> true
+             _ -> false
+           end)
+
+    assert Enum.any?(events, fn
+             {:tool_result, %{name: "echo", output: %{echo: "hi"}}} -> true
+             _ -> false
+           end)
+
+    assert {:content, "done"} in events
+    assert Enum.any?(events, &match?({:done, %{content: "done"}}, &1))
+  end
 end

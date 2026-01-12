@@ -281,12 +281,17 @@ defmodule Jido.AI.Tools.Manager do
   # =============================================================================
 
   defp init_stream_state(conversation, tools, action_map, context, max_iterations, opts) do
+    llm_stream? = Keyword.get(opts, :llm_stream, true)
+    emit_thinking? = Keyword.get(opts, :emit_thinking, false)
+
     %{
       conversation: conversation,
       tools: tools,
       action_map: action_map,
       context: context,
       opts: opts,
+      llm_stream?: llm_stream?,
+      emit_thinking?: emit_thinking?,
       iterations_left: max_iterations,
       phase: :call_llm,
       accumulated_content: "",
@@ -306,31 +311,41 @@ defmodule Jido.AI.Tools.Manager do
   defp stream_next(%{phase: :call_llm} = state) do
     {:ok, messages} = ConversationManager.get_messages_for_llm(state.conversation.id)
 
-    case call_llm_stream(state.conversation.model, messages, state.tools, state.opts) do
-      {:ok, llm_stream} ->
-        {stream_response, cursor} =
-          case llm_stream do
-            %ReqLLM.StreamResponse{stream: inner_stream} = sr ->
-              {sr, {:start, inner_stream}}
+    if state.llm_stream? do
+      case call_llm_stream(state.conversation.model, messages, state.tools, state.opts) do
+        {:ok, llm_stream} ->
+          {stream_response, cursor} =
+            case llm_stream do
+              %ReqLLM.StreamResponse{stream: inner_stream} = sr ->
+                {sr, {:start, inner_stream}}
 
-            other ->
-              {nil, {:start, other}}
-          end
+              other ->
+                {nil, {:start, other}}
+            end
 
-        new_state = %{
-          state
-          | phase: :streaming,
-            stream_response: stream_response,
-            stream_cursor: cursor,
-            stream_buffer: [],
-            accumulated_content: "",
-            accumulated_tool_calls: []
-        }
+          new_state = %{
+            state
+            | phase: :streaming,
+              stream_response: stream_response,
+              stream_cursor: cursor,
+              stream_buffer: [],
+              accumulated_content: "",
+              accumulated_tool_calls: []
+          }
 
-        stream_next(new_state)
+          stream_next(new_state)
 
-      {:error, reason} ->
-        {[{:error, reason}], %{state | done: true}}
+        {:error, reason} ->
+          {[{:error, reason}], %{state | done: true}}
+      end
+    else
+      case call_llm(state.conversation.model, messages, state.tools, state.opts) do
+        {:ok, response} ->
+          handle_non_stream_response(response, state)
+
+        {:error, reason} ->
+          {[{:error, reason}], %{state | done: true}}
+      end
     end
   end
 
@@ -339,6 +354,7 @@ defmodule Jido.AI.Tools.Manager do
       {:chunk, raw_chunk, next_cursor} ->
         chunk = normalize_chunk(raw_chunk)
         content = Map.get(chunk, :content, "")
+        thinking = Map.get(chunk, :thinking, "")
         chunk_tool_calls = Map.get(chunk, :tool_calls, [])
         new_content = state.accumulated_content <> content
         new_tool_calls = state.accumulated_tool_calls ++ chunk_tool_calls
@@ -358,10 +374,15 @@ defmodule Jido.AI.Tools.Manager do
             accumulated_tool_calls: new_tool_calls
         }
 
-        if content != "" do
-          {[{:content, content}], new_state}
-        else
-          stream_next(new_state)
+        cond do
+          thinking != "" and state.emit_thinking? ->
+            {[{:status, %{status: :thinking, message: thinking}}], new_state}
+
+          content != "" ->
+            {[{:content, content}], new_state}
+
+          true ->
+            stream_next(new_state)
         end
 
       {:done, _reason} ->
@@ -456,6 +477,52 @@ defmodule Jido.AI.Tools.Manager do
     end
   end
 
+  defp handle_non_stream_response(response, state) do
+    content = Map.get(response, :content, "") || ""
+    tool_calls = extract_tool_calls(response)
+
+    if tool_calls != [] do
+      :ok =
+        ConversationManager.add_message(
+          state.conversation.id,
+          :assistant,
+          content,
+          tool_calls: tool_calls
+        )
+
+      thinking_chunks =
+        if state.emit_thinking? and content != "" do
+          [{:status, %{status: :thinking, message: content}}]
+        else
+          []
+        end
+
+      tool_chunks = Enum.map(tool_calls, fn tc -> {:tool_call, tc} end)
+
+      new_state = %{
+        state
+        | phase: :execute_tools,
+          pending_tool_calls: tool_calls,
+          stream_response: nil,
+          stream_cursor: nil,
+          stream_buffer: []
+      }
+
+      {thinking_chunks ++ tool_chunks, new_state}
+    else
+      :ok = ConversationManager.add_message(state.conversation.id, :assistant, content)
+
+      final = %{
+        content: content,
+        conversation_id: state.conversation.id
+      }
+
+      # In non-stream mode we emit the full answer as a single :content chunk so
+      # renderers can display it before :done.
+      {[{:content, content}, {:done, final}], %{state | done: true}}
+    end
+  end
+
   defp cursor_step({:start, enumerable}) do
     reducer = fn chunk, _acc -> {:suspend, chunk} end
 
@@ -511,8 +578,7 @@ defmodule Jido.AI.Tools.Manager do
   end
 
   defp normalize_chunk(%ReqLLM.StreamChunk{type: :thinking} = chunk) do
-    # Include thinking tokens as content (for models like Claude)
-    %{content: chunk.text || "", tool_calls: []}
+    %{thinking: chunk.text || "", content: "", tool_calls: []}
   end
 
   defp normalize_chunk(%ReqLLM.StreamChunk{type: :tool_call} = chunk) do
