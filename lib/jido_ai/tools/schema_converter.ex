@@ -59,6 +59,8 @@ defmodule Jido.AI.Tools.SchemaConverter do
   """
   @spec action_to_tool(module()) :: map()
   def action_to_tool(action_module) do
+    _ = Code.ensure_loaded?(action_module)
+
     %{
       type: "function",
       function: %{
@@ -82,6 +84,7 @@ defmodule Jido.AI.Tools.SchemaConverter do
   @spec build_action_map([module()]) :: %{String.t() => module()}
   def build_action_map(action_modules) do
     Map.new(action_modules, fn module ->
+      _ = Code.ensure_loaded?(module)
       {get_action_name(module), module}
     end)
   end

@@ -199,6 +199,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
 
     with {:ok, model} <- validate_model(params_with_defaults.model),
          {:ok, messages} <- normalize_messages(params_with_defaults),
+         _ <- (if length(messages) > 2, do: Logger.debug("[ChatCompletion] All messages: #{inspect(messages, limit: :infinity, printable_limit: 500)}"), else: :ok),
          {:ok, req_options} <- build_req_llm_options(model, params_with_defaults),
          result <- call_reqllm(model, messages, req_options, params_with_defaults) do
       result
@@ -264,7 +265,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
           params.prompt
           |> Prompt.render()
           |> Enum.map(fn msg ->
-            %{role: Atom.to_string(msg.role), content: msg.content}
+            %{role: msg.role, content: msg.content}
           end)
 
         {:ok, messages}
@@ -278,30 +279,77 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     normalized =
       Enum.map(messages, fn
         msg when is_binary(msg) ->
-          %{role: "user", content: msg}
+          %{role: :user, content: msg}
 
         msg when is_map(msg) ->
-          role = Map.get(msg, :role) || Map.get(msg, "role") || "user"
+          role = Map.get(msg, :role) || Map.get(msg, "role") || :user
           content = Map.get(msg, :content) || Map.get(msg, "content") || ""
 
+          # Keep roles as atoms - req_llm expects atoms for :tool role
           role =
             case role do
-              r when is_atom(r) -> Atom.to_string(r)
-              r when is_binary(r) -> r
-              other -> to_string(other)
+              r when is_atom(r) -> r
+              "user" -> :user
+              "assistant" -> :assistant
+              "system" -> :system
+              "tool" -> :tool
+              other -> String.to_existing_atom(other)
             end
 
-          %{
-            role: role,
-            content: content
-          }
-          |> maybe_put(:tool_calls, Map.get(msg, :tool_calls) || Map.get(msg, "tool_calls"))
-          |> maybe_put(:tool_call_id, Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id"))
-          |> maybe_put(:name, Map.get(msg, :name) || Map.get(msg, "name"))
+          # Tool messages need special handling - create ReqLLM Message struct directly
+          # to ensure tool_call_id is preserved (convert_loose_map can strip it)
+          if role == :tool do
+            tool_call_id = Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id")
+            name = Map.get(msg, :name) || Map.get(msg, "name")
+
+            Logger.debug("[ChatCompletion] Creating tool result: tool_call_id=#{inspect(tool_call_id)}, name=#{inspect(name)}, content length=#{String.length(content || "")}")
+
+            if name do
+              ReqLLM.Context.tool_result(tool_call_id, name, content)
+            else
+              ReqLLM.Context.tool_result(tool_call_id, content)
+            end
+          else
+            # For non-tool messages
+            tool_calls = Map.get(msg, :tool_calls) || Map.get(msg, "tool_calls")
+
+            # For assistant messages with tool_calls, use ReqLLM.Context.assistant/2 with tool_calls
+            # so we produce canonical tool call structs and avoid deprecated APIs.
+            if role == :assistant && is_list(tool_calls) && length(tool_calls) > 0 do
+              # Flatten to ReqLLM's expected format: [{name, args, id: id}, ...]
+              tool_tuples = Enum.map(tool_calls, fn tc ->
+                name =
+                  get_in(tc, [:function, :name]) ||
+                    get_in(tc, ["function", "name"]) ||
+                    tc[:name] ||
+                    tc["name"]
+
+                args =
+                  get_in(tc, [:function, :arguments]) ||
+                    get_in(tc, ["function", "arguments"]) ||
+                    tc[:arguments] ||
+                    tc["arguments"]
+
+                id = tc[:id] || tc["id"]
+                {name, args, id: id}
+              end)
+
+              Logger.debug("[ChatCompletion] Creating assistant with tool calls: #{inspect(tool_tuples)}")
+              ReqLLM.Context.assistant(content || "", tool_calls: tool_tuples)
+            else
+              # Plain messages without tool_calls
+              %{
+                role: role,
+                content: content
+              }
+              |> maybe_put(:tool_call_id, Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id"))
+              |> maybe_put(:name, Map.get(msg, :name) || Map.get(msg, "name"))
+            end
+          end
 
         other ->
           %{
-            role: "user",
+            role: :user,
             content: inspect(other)
           }
       end)
@@ -398,62 +446,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
   end
 
   defp format_response(%{content: content, tool_calls: tool_calls}) when is_list(tool_calls) do
-    formatted_tool_calls =
-      Enum.map(tool_calls, fn
-        %ReqLLM.ToolCall{} = tool_call ->
-          %{
-            id: tool_call.id,
-            function: %{
-              name: tool_call.function.name,
-              arguments: tool_call.function.arguments
-            }
-          }
-
-        %{id: _id, function: %{name: _name, arguments: _arguments}} = tool_call ->
-          tool_call
-
-        %{"id" => _id, "function" => %{"name" => _name, "arguments" => _arguments}} = tool_call ->
-          tool_call
-
-        %{name: name, arguments: arguments} ->
-          %{
-            id: nil,
-            function: %{
-              name: name,
-              arguments:
-                if is_binary(arguments) do
-                  arguments
-                else
-                  Jason.encode!(arguments)
-                end
-            }
-          }
-
-        %{"name" => name, "arguments" => arguments} ->
-          %{
-            id: nil,
-            function: %{
-              name: name,
-              arguments:
-                if is_binary(arguments) do
-                  arguments
-                else
-                  Jason.encode!(arguments)
-                end
-            }
-          }
-
-        other ->
-          %{
-            id: nil,
-            function: %{
-              name: "unknown",
-              arguments: Jason.encode!(%{raw: inspect(other)})
-            }
-          }
-      end)
-
-    {:ok, %{content: content, tool_results: formatted_tool_calls}}
+    {:ok, %{content: content, tool_results: Enum.map(tool_calls, &normalize_tool_result/1)}}
   end
 
   defp format_response(%{content: content}) do
@@ -465,6 +458,45 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     content = response[:content] || response["content"] || ""
     {:ok, %{content: content, tool_results: []}}
   end
+
+  defp normalize_tool_result(%ReqLLM.ToolCall{} = tool_call) do
+    %{
+      id: tool_call.id,
+      name: tool_call.function.name,
+      arguments: decode_tool_args(tool_call.function.arguments)
+    }
+  end
+
+  defp normalize_tool_result(%{id: id, function: %{name: name, arguments: arguments}}) do
+    %{id: id, name: name, arguments: decode_tool_args(arguments)}
+  end
+
+  defp normalize_tool_result(%{"id" => id, "function" => %{"name" => name, "arguments" => arguments}}) do
+    %{id: id, name: name, arguments: decode_tool_args(arguments)}
+  end
+
+  defp normalize_tool_result(%{name: name, arguments: arguments} = tool_call) do
+    %{id: Map.get(tool_call, :id), name: name, arguments: decode_tool_args(arguments)}
+  end
+
+  defp normalize_tool_result(%{"name" => name, "arguments" => arguments} = tool_call) do
+    %{id: Map.get(tool_call, "id"), name: name, arguments: decode_tool_args(arguments)}
+  end
+
+  defp normalize_tool_result(other) do
+    %{id: nil, name: "unknown", arguments: %{raw: inspect(other)}}
+  end
+
+  defp decode_tool_args(args) when is_map(args), do: args
+
+  defp decode_tool_args(args) when is_binary(args) do
+    case Jason.decode(args) do
+      {:ok, decoded} when is_map(decoded) -> decoded
+      _ -> %{"raw" => args}
+    end
+  end
+
+  defp decode_tool_args(_), do: %{}
 
   defp normalize_tools(tools) when is_list(tools) do
     tool_specs = Enum.map(tools, &to_req_llm_tool/1)
