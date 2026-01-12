@@ -79,14 +79,21 @@ defmodule Jido.AI.Conversation.Message do
   @spec to_llm_format(t()) :: map()
   def to_llm_format(%__MODULE__{} = message) do
     base = %{
-      role: to_string(message.role),
+      role: message.role,
       content: message.content
     }
 
-    base
+    result = base
     |> maybe_add_tool_calls(message)
     |> maybe_add_tool_call_id(message)
     |> maybe_add_name(message)
+
+    if message.role == :tool do
+      require Logger
+      Logger.debug("[Message.to_llm_format] Tool message: #{inspect(result)}")
+    end
+
+    result
   end
 
   defp maybe_add_tool_calls(map, %{tool_calls: []}), do: map

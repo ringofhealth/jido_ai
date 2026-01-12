@@ -199,6 +199,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
 
     with {:ok, model} <- validate_model(params_with_defaults.model),
          {:ok, messages} <- normalize_messages(params_with_defaults),
+         _ <- (if length(messages) > 2, do: Logger.debug("[ChatCompletion] All messages: #{inspect(messages, limit: :infinity, printable_limit: 500)}"), else: :ok),
          {:ok, req_options} <- build_req_llm_options(model, params_with_defaults),
          result <- call_reqllm(model, messages, req_options, params_with_defaults) do
       result
@@ -264,7 +265,7 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
           params.prompt
           |> Prompt.render()
           |> Enum.map(fn msg ->
-            %{role: Atom.to_string(msg.role), content: msg.content}
+            %{role: msg.role, content: msg.content}
           end)
 
         {:ok, messages}
@@ -278,30 +279,67 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     normalized =
       Enum.map(messages, fn
         msg when is_binary(msg) ->
-          %{role: "user", content: msg}
+          %{role: :user, content: msg}
 
         msg when is_map(msg) ->
-          role = Map.get(msg, :role) || Map.get(msg, "role") || "user"
+          role = Map.get(msg, :role) || Map.get(msg, "role") || :user
           content = Map.get(msg, :content) || Map.get(msg, "content") || ""
 
+          # Keep roles as atoms - req_llm expects atoms for :tool role
           role =
             case role do
-              r when is_atom(r) -> Atom.to_string(r)
-              r when is_binary(r) -> r
-              other -> to_string(other)
+              r when is_atom(r) -> r
+              "user" -> :user
+              "assistant" -> :assistant
+              "system" -> :system
+              "tool" -> :tool
+              other -> String.to_existing_atom(other)
             end
 
-          %{
-            role: role,
-            content: content
-          }
-          |> maybe_put(:tool_calls, Map.get(msg, :tool_calls) || Map.get(msg, "tool_calls"))
-          |> maybe_put(:tool_call_id, Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id"))
-          |> maybe_put(:name, Map.get(msg, :name) || Map.get(msg, "name"))
+          # Tool messages need special handling - create ReqLLM Message struct directly
+          # to ensure tool_call_id is preserved (convert_loose_map can strip it)
+          if role == :tool do
+            tool_call_id = Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id")
+            name = Map.get(msg, :name) || Map.get(msg, "name")
+
+            Logger.debug("[ChatCompletion] Creating tool result: tool_call_id=#{inspect(tool_call_id)}, name=#{inspect(name)}, content length=#{String.length(content || "")}")
+
+            if name do
+              ReqLLM.Context.tool_result(tool_call_id, name, content)
+            else
+              ReqLLM.Context.tool_result(tool_call_id, content)
+            end
+          else
+            # For non-tool messages
+            tool_calls = Map.get(msg, :tool_calls) || Map.get(msg, "tool_calls")
+
+            # For assistant messages with tool_calls, use ReqLLM.Context.assistant_with_tools
+            # to create proper Message struct with correctly formatted ToolCall structs
+            if role == :assistant && is_list(tool_calls) && length(tool_calls) > 0 do
+              # Flatten to ReqLLM's expected format: [{name, args, id: id}, ...]
+              tool_tuples = Enum.map(tool_calls, fn tc ->
+                name = get_in(tc, [:function, :name]) || tc[:name] || tc["function"]["name"] || tc["name"]
+                args = get_in(tc, [:function, :arguments]) || tc[:arguments] || tc["function"]["arguments"] || tc["arguments"]
+                id = tc[:id] || tc["id"]
+                {name, args, id: id}
+              end)
+
+              Logger.debug("[ChatCompletion] Creating assistant_with_tools: #{inspect(tool_tuples)}")
+              ReqLLM.Context.assistant_with_tools(tool_tuples, content)
+            else
+              # Plain messages without tool_calls
+              %{
+                role: role,
+                content: content
+              }
+              |> maybe_put(:tool_call_id, Map.get(msg, :tool_call_id) || Map.get(msg, "tool_call_id"))
+              |> maybe_put(:name, Map.get(msg, :name) || Map.get(msg, "name"))
+            end
+          end
 
         other ->
           %{
-            role: "user",
+            role: :user,
             content: inspect(other)
           }
       end)

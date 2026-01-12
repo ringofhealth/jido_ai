@@ -291,6 +291,7 @@ defmodule Jido.AI.Tools.Manager do
       phase: :call_llm,
       accumulated_content: "",
       accumulated_tool_calls: [],
+      pending_tool_calls: [],
       current_stream: nil,
       done: false
     }
@@ -355,10 +356,12 @@ defmodule Jido.AI.Tools.Manager do
 
   defp stream_next(%{phase: :execute_tools, pending_tool_calls: tool_calls} = state) do
     # Execute tools and emit results
+    Logger.debug("[Tools.Manager] Executing tools: #{inspect(tool_calls, limit: 3)}")
     results = execute_tools(tool_calls, state.action_map, state.context)
 
     # Add tool results to conversation
     Enum.each(results, fn result ->
+      Logger.debug("[Tools.Manager] Tool result: #{result.name}, tool_call_id: #{inspect(result.tool_call_id)}")
       output =
         case result.output do
           s when is_binary(s) -> s
